@@ -11,6 +11,11 @@
 - [Ветвление и Git-процесс](./branching.md)
 - [CI/CD (обзор)](#cicd-обзор)
 
+## Спецификации
+
+- [Общая](./specification_full.md)
+- [Фронтенд](./specification_frontend.md)
+- [Бэкенд](./specification_backend.md)
 ---
 
 ## Технологии команды
