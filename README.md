@@ -16,6 +16,7 @@
 - [Общая](./specification_full.md)
 - [Фронтенд](./specification_frontend.md)
 - [Бэкенд](./specification_backend.md)
+- [OpenAPI](./api/dfsp-server-v0.yml)
 ---
 
 ## Технологии команды
