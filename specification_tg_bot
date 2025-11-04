@@ -1,0 +1,268 @@
+# 1) Цели и ограничения
+
+- **Никаких приватных ключей в боте.** Подписей EIP-712 в боте нет. Любые действия, требующие подписи (share/revoke/strict-download), делаем через **веб-клиент + кошелёк** (MetaMask/WalletConnect/локальный).
+    
+- **Бот = companion:** уведомления, краткие списки/детали, `handoff`-ссылки на веб.
+    
+- **Без Mini Apps:** только классический бот (Webhook/long-polling), сообщения и кнопки.
+    
+
+---
+
+# 2) Архитектура (высокоуровнево)
+
+- **Bot-service** (отдельный процесс/деплой): принимает webhook, ходит в DFSP API (read-only) и подписывается на события из шины/очереди (grant/download/audit/relayer).
+    
+- **DFSP API (ваш бэкенд):**
+    
+    - Эндпоинты линковки TG↔кошелька.
+        
+    - Эндпоинты данных (files/grants/verify summary).
+        
+    - Генерация `handoff state` (одноразовый короткоживущий токен) для действий с подписью.
+        
+    - Публикация событий в очередь (для нотификаций).
+        
+- **Очередь событий** (Redis/Rabbit/Kafka): тема `tg.notifications.*`.
+    
+- **Веб-клиент:** принимает `handoff state` → нормальный флоу EIP-712 в кошельке.
+    
+
+---
+
+# 3) Пользовательские флоу
+
+## 3.1 Линковка Telegram ↔ кошелёк (без Mini App)
+
+**Flow: link-url (рекомендуемый)**
+
+1. Пользователь в боте → `/link`.
+    
+2. Bot-service вызывает `POST /tg/link-start` → получает `link_token (ttl≈10 мин)`.
+    
+3. Бот отправляет кнопку/URL: `https://app.example.com/tg/link?token=<link_token>`.
+    
+4. Пользователь открывает ссылку → логинится обычным способом (EIP-712).
+    
+5. FE вызывает `POST /tg/link-complete { link_token, wallet_address }`.
+    
+6. BE валидирует токен, сверяет активную сессию, записывает маппинг `(chat_id ↔ wallet_address)`.
+    
+7. Бот подтверждает: «Аккаунт привязан к 0x1234…abcd».
+    
+
+**Альтернатива: код из бота**
+
+- `/link` выдаёт код (6-8 цифр); на `/tg/link` веб-форма + верификация кода.
+    
+
+**Безопасность:**
+
+- `link_token` одноразовый, короткий TTL, **не содержит chat_id** в URL (хранится на сервере).
+    
+- Ограничение частоты генерации токенов, логирование, HMAC/PRNG.
+    
+
+## 3.2 Handoff-действия (share/revoke/strict-download)
+
+- Бот отдаёт ссылку: `https://app.example.com/action?state=<opaque>`.
+    
+- `state` — одноразовый токен (TTL 10–15 мин), в БД хранится намерение: `type, owner_wallet, params`.
+    
+- FE открывает страницу → по `state` подтягивает intent → показывает подтверждение → **подпись EIP-712** в кошельке → API исполняет (meta-tx/релейер).
+    
+
+---
+
+# 4) Функциональность бота
+
+## 4.1 Команды (MVP)
+
+- `/start` — приветствие, политика приватности, «Привязать аккаунт».
+    
+- `/link` — запустить линковку (выдаёт link-url/код).
+    
+- `/unlink` — отвязать маппинг (подтверждение).
+    
+- `/me` — связанный адрес, организация/роль (если есть), включённые уведомления.
+    
+- `/files` — последние N файлов: `name, size, lastCID, updatedAt` + кнопки «Открыть/Verify» (веб-ссылки).
+    
+- `/grants` — входящие/исходящие (переключатель): `capId, файл, used/max, expires` + кнопки «Открыть» и **«Отозвать» (handoff)**.
+    
+- `/verify <fileId>` — короткий результат: on-chain vs off-chain (OK/не OK), ссылка на полную страницу.
+    
+- `/help` — список команд.
+    
+
+**UX:**
+
+- MarkdownV2/HTML parse mode, короткие тексты, маскировать адреса/capId (`0x1234…abcd`).
+    
+- Пагинация (кнопки «Следующие» с callback_data), TTL кэша ответа 10–30 сек.
+    
+
+## 4.2 Уведомления
+
+- **Grant:** выдано / получено / скоро истекает / лимит исчерпан / отозвано.
+    
+- **Download:** разрешено / заблокировано политикой (краткая причина: geo/role/time/quota).
+    
+- **Audit/Anchoring:** дневной анкор успешно записан (tx), verify без ошибок.
+    
+- **Relayer:** высокая очередь/ретраи (для владельцев/админов).
+    
+
+**Анти-спам:**
+
+- Дедуп по `event_id`, коалесинг (объединять частые события), суточный лимит сообщений на пользователя.
+    
+
+---
+
+# 5) API контракты (DFSP API)
+
+## 5.1 Линковка
+
+- `POST /tg/link-start`  
+    **in:** `{ chat_id: number }` (передаёт bot-service)  
+    **out:** `{ link_token: string, expires_at: iso }`
+    
+- `POST /tg/link-complete` _(только с валидным JWT)_  
+    **in:** `{ link_token: string, wallet_address: string }`  
+    **out:** `{ ok: true }`
+    
+- `DELETE /tg/link` _(JWT или через бота с подтверждением)_  
+    **in:** `{}`  
+    **out:** `{ ok: true }`
+    
+- `GET /tg/me` _(bot-service не зовёт; это FE-страница профиля)_  
+    **out:** `{ address, org?, notifications? }`
+    
+
+## 5.2 Read-only данные для бота
+
+- `GET /bot/files?limit=10&cursor=...`  
+    **out:** `{ items:[{ id_hex,name,size,mime,cid,updatedAt }], next_cursor? }`
+    
+- `GET /bot/grants?direction=in|out&limit=10&cursor=...`  
+    **out:** `{ items:[{ capId,fileName,used,max,expiresAt,status }], next_cursor? }`
+    
+- `GET /bot/verify/:fileId`  
+    **out:** `{ onchain_ok:boolean, offchain_ok:boolean, match:boolean, lastAnchorTx?:string }`
+    
+
+> Эти ручки могут быть тонкими обёртками над существующими, но с компактным payload и ACL по `wallet_address`.
+
+## 5.3 Handoff intents
+
+- `POST /bot/action-intents` _(JWT)_  
+    **in:** `{ type:"revoke"|"share"|"download_strict", params:{...} }`  
+    **out:** `{ state:"opaque", expires_at }`
+    
+- `POST /bot/action-intents/consume` _(JWT)_  
+    **in:** `{ state }`  
+    **out:** `{ type, params }` _(одноразово; дальше FE ведёт обычный EIP-712 флоу)._
+    
+
+## 5.4 Внутренние события для нотификаций
+
+- Паблишер шлёт в очередь сообщения вида:
+    
+    ```json
+    {
+      "event_id":"uuid",
+      "type":"grant_created|grant_revoked|download_allowed|download_denied|anchor_ok|relayer_warn",
+      "address":"0x..",             // владелец/грантополучатель (для маршрутизации)
+      "file_id":"0x..",
+      "cap_id":"0x..",
+      "reason":"policy_geo|role|time|quota",
+      "tx":"0x..",
+      "created_at":"2025-.."
+    }
+    ```
+    
+
+---
+
+# 6) Модель данных (Postgres)
+
+## 6.1 Связки и настройки
+
+```sql
+CREATE TABLE telegram_links (
+  chat_id       BIGINT      NOT NULL,
+  wallet_address TEXT       NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at    TIMESTAMPTZ,
+  flags         JSONB       NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (chat_id, wallet_address)
+);
+CREATE INDEX ix_tg_links_wallet ON telegram_links(wallet_address) WHERE revoked_at IS NULL;
+```
+
+## 6.2 Интенты (handoff state)
+
+```sql
+CREATE TABLE action_intents (
+  id            UUID        PRIMARY KEY,      -- state (opaque)
+  owner_address TEXT        NOT NULL,
+  type          TEXT        NOT NULL,         -- revoke/share/download_strict
+  data          JSONB       NOT NULL,
+  expires_at    TIMESTAMPTZ NOT NULL,
+  used_at       TIMESTAMPTZ
+);
+CREATE INDEX ix_intents_owner ON action_intents(owner_address);
+```
+
+---
+
+# 7) Безопасность и приватность
+
+- **Ключи и encK** никогда не попадают в бота. Бот не подписывает и не расшифровывает.
+    
+- `link_token`/`state` — одноразовые, короткий TTL, серверная проверка, привязка к ожидаемому `chat_id`/`address`.
+    
+- Минимизация PII: храним только `chat_id`, `wallet_address`, настройки нотификаций. Команда `/unlink` и «право быть забытым».
+    
+- Валидации форматов: `fileId`/`capId` = `0x` + 64 hex.
+    
+- Рейт-лимиты на команды/линковки/уведомления.
+    
+- Логи с маскированием адресов, без чувствительных payload-ов.
+    
+
+---
+
+# 8) DevOps/Инфра
+
+- **Bot webhook**: HTTPS, secret token, IP allow-list Telegram, retry-политика.
+    
+- **Secrets**: BOT_TOKEN, DFSP_API_URL, DFSP_API_TOKEN (service), QUEUE_DSN.
+    
+- **Мониторинг**: метрики — `tg_notify_sent_total{type}`, `tg_notify_dropped_total{reason}`, `tg_webhook_errors_total{code}`, `tg_outbound_rate_limited_total`, лаг очереди.
+    
+- **Алерты**: рост ошибок webhook, лаг очереди, всплеск дропа, частые релейер-предупреждения.
+    
+- **Деплой**: отдельно от API, горизонтальное масштабирование бота, backoff при ошибках Telegram API.
+    
+
+---
+
+# 9) Тексты сообщений (примеры, RU)
+
+- **Grant created (owner):**  
+    `✅ Вы выдали доступ к «{file}» для {granteeShort}. Лимит: {used}/{max}, до {expiresAt}. [Открыть] [Отозвать]`
+    
+- **Grant received (grantee):**  
+    `🎁 Вам выдали доступ к «{file}» от {ownerShort}. Действует до {expiresAt}. [Открыть]`
+    
+- **Download denied:**  
+    `⛔ Загрузка «{file}» отклонена политикой: {reasonHuman}.`
+    
+- **Anchor ok:**  
+    `🔗 Дневной отчёт за {date} заанкорен (tx: {txShort}).`
+    
+- **Relayer warn (owner/admin):**  
+    `⚠️ Очередь релейера увеличена. Подтверждения могут задерживаться.`
+    
